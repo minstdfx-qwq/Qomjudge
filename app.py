@@ -1,0 +1,1494 @@
+"""DOMjudge-style client for QOJ participation, with local team devices and printing."""
+from __future__ import annotations
+
+import argparse
+from copy import deepcopy
+import hmac
+import json
+import math
+import os
+import re
+import secrets
+import threading
+import time
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
+
+from bs4 import BeautifulSoup
+from flask import Flask, Response, g, jsonify, request, send_file, send_from_directory, session
+from werkzeug.exceptions import HTTPException
+
+from cli_auth import CLIAuthError, CLITokenStore
+from ccpc import CCPCConfig, CCPCScoreboard
+from demo import DemoClient
+from downloads import attachment_response
+from external_submissions import merge_submissions
+from joint_entry import authorize_entry, prepare_entry, validate_preparation
+from joint_vp import JointVPError, JointVPService
+from printing import MAX_PRINT_SIZE, MAX_RUN_BYTES, MAX_RUN_FILES, PrintError, PrintStore, render_print
+from qoj import QOJClient, QOJError, rewrite_proxy
+from storage import Store, score
+from statements import StatementPDFCache, statement_pdfs
+from teams import TeamError, TeamStore
+from scheduled_vp import ScheduledVP, ScheduleError
+from xcpcio import XCPCIOBoard, XCPCIOError, board_url
+from rankland import RankLandBoard
+
+ROOT = Path(__file__).resolve().parent
+
+
+class AppError(Exception):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+def create_app(contest_id=1802, demo=False, duration_minutes=None, data_dir=None, client_factory=None, freeze_minutes=0, mode="vp", scoreboard="auto", show_unofficial=None,
+               scoreboard_style="standard", ccpc_unlock=None, ccpc_unlock_overrides=None, ccpc_reveal_after=None,
+               xcpcio_url=None, vp_rule="icpc", rankland_url=None):
+    if isinstance(contest_id, bool) or not isinstance(contest_id, int) or contest_id < 1:
+        raise ValueError("contest_id 必须是正整数")
+    if duration_minutes is not None and not 1 <= duration_minutes <= 10080:
+        raise ValueError("duration_minutes 必须在 1 到 10080 之间")
+    if isinstance(freeze_minutes, bool) or not isinstance(freeze_minutes, int) or not 0 <= freeze_minutes <= 10080:
+        raise ValueError("freeze_minutes 必须是 0 到 10080 之间的整数")
+    if mode not in {"vp", "official"}:
+        raise ValueError("mode 必须为 vp 或 official")
+    if not demo and (duration_minutes is not None or freeze_minutes):
+        raise ValueError("真实比赛的时间与封榜由 QOJ 决定，不能在本地覆盖。")
+    if scoreboard not in {"auto", "pc2"}:
+        raise ValueError("scoreboard 必须为 auto 或 pc2")
+    if show_unofficial is not None and not isinstance(show_unofficial, bool):
+        raise ValueError("show_unofficial 必须为布尔值或 None")
+    ccpc_config = CCPCConfig(style=scoreboard_style, unlock=ccpc_unlock,
+                             overrides=ccpc_unlock_overrides, reveal_after=ccpc_reveal_after)
+    if vp_rule not in {'icpc', 'ccpc26'}:
+        raise ValueError('VP 赛制须为 icpc 或 ccpc26。')
+    if vp_rule == 'ccpc26' and (not rankland_url or xcpcio_url or scoreboard_style != 'standard' or demo):
+        raise ValueError('CCPC26 必须填写 RankLand / vp.xcpc.link 榜单链接，不能同时使用其它榜单模式。')
+    if rankland_url and vp_rule != 'ccpc26':
+        raise ValueError('--rankland-url 需要 --vp-rule ccpc26。')
+    xcpcio_board = (RankLandBoard(rankland_url) if vp_rule == 'ccpc26'
+                     else XCPCIOBoard(board_url(xcpcio_url)) if xcpcio_url else None)
+    data_dir = Path(data_dir or ROOT / ".data")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    secret_path = data_dir / "server-secret.key"
+    if not secret_path.exists():
+        try:
+            with secret_path.open("xb") as secret_file:
+                secret_file.write(secrets.token_bytes(32))
+            if os.name != "nt":
+                secret_path.chmod(0o600)
+        except FileExistsError:
+            pass
+    app = Flask(__name__, static_folder=str(ROOT / "static"), static_url_path="/static")
+    app.config.update(SECRET_KEY=secret_path.read_bytes(), MAX_CONTENT_LENGTH=3 * 1024 * 1024,
+                      SESSION_COOKIE_NAME="qoj_vp_session", SESSION_COOKIE_HTTPONLY=True,
+                      SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=30 * 86400)
+    store = Store(data_dir / "vp.sqlite3")
+    teams = TeamStore(data_dir / "vp.sqlite3")
+    cli_tokens = CLITokenStore(data_dir / "vp.sqlite3")
+    prints = PrintStore(store, data_dir / "prints")
+    app.extensions["store"] = store
+    app.extensions["teams"] = teams
+    app.extensions["cli_tokens"] = cli_tokens
+    app.extensions["prints"] = prints
+    ccpc_board = CCPCScoreboard(data_dir / "vp.sqlite3", ccpc_config, app.config["SECRET_KEY"]) if scoreboard_style == "ccpc" else None
+    app.extensions["ccpc_scoreboard"] = ccpc_board
+    contest_key = ("demo:" if demo else "qoj:") + str(contest_id)
+    factory = client_factory or (DemoClient if demo else QOJClient)
+    clients = {}
+    registry_lock = threading.Lock()
+    app.extensions["clients"] = clients
+    statement_cache = StatementPDFCache()
+    app.extensions["statement_cache"] = statement_cache
+    app.extensions['xcpcio_board'] = xcpcio_board
+
+    def launch_scheduled(owner, binding):
+        with app.app_context():
+            team = teams.access(owner, contest_key)
+            if not team or team['id'] != binding['team_id'] or team['role'] != 'captain':
+                raise ScheduleError('队伍或队长身份已变化，定时开赛已停止。')
+            rt = clients.get(owner)
+            if rt is None:
+                raise ScheduleError('QOJ 会话已失效，请重新连接。')
+            g.runtime, g.owner_sid, g.team, g.role = rt, owner, team, 'captain'
+            with rt['client'].lock:
+                joint_check_account(rt, owner, binding['username'])
+                joint_vp.guard_mutation(team, start=True)
+                try:
+                    return authorize_entry(rt['client'], contest_id, binding['fingerprint'], binding['action'], binding['values'])
+                finally:
+                    invalidate_native()
+
+    scheduled_vp = ScheduledVP(launch_scheduled)
+    app.extensions['scheduled_vp'] = scheduled_vp
+
+    def joint_runtime(team_id, owner_sid):
+        """Resolve an authorized captain outside any browser/request context."""
+        team = teams.access(owner_sid, contest_key)
+        if not team or team["id"] != team_id or team["role"] != "captain":
+            raise AppError("队长身份已失效，请重新加入联合 VP。", 403)
+        with registry_lock:
+            rt = clients.get(owner_sid)
+        if rt is None:
+            raise AppError("请由队长重新连接 QOJ，并重新准备。", 409)
+        return rt
+
+    def joint_check_account(rt, owner_sid, expected=None):
+        client = rt["client"]
+        if store.participation_mode(owner_sid, contest_key, mode) != "vp":
+            raise AppError("联合 VP 仅支持虚拟参赛，请切换为 VP 后重新准备。", 409)
+        if not client.authenticated or not client.username:
+            raise AppError("QOJ 登录已失效，请由队长重新连接并准备。", 401)
+        if expected is not None and client.username != expected:
+            raise AppError("QOJ 账号发生变化，请重新准备。", 409)
+
+    def joint_observe(team_id, owner_sid):
+        rt = joint_runtime(team_id, owner_sid)
+        with rt["client"].lock:
+            joint_check_account(rt, owner_sid)
+            username = rt["client"].username
+            snapshot = rt["client"].participation(contest_id, "vp")
+            joint_check_account(rt, owner_sid, username)
+            return {**{key: snapshot.get(key) for key in ("status", "started_at", "ends_at", "message", "entry_uncertain")},
+                    "authenticated": True, "username": username, "mode": snapshot.get("mode", "vp")}
+
+    def joint_prepare(team_id, owner_sid):
+        scheduled_vp.guard(owner_sid)
+        rt = joint_runtime(team_id, owner_sid)
+        with rt["client"].lock:
+            joint_check_account(rt, owner_sid)
+            username = rt["client"].username
+            plan = prepare_entry(rt["client"], contest_id)
+            joint_check_account(rt, owner_sid, username)
+            return plan
+
+    def joint_launch(team_id, owner_sid, grant):
+        scheduled_vp.guard(owner_sid)
+        rt = joint_runtime(team_id, owner_sid)
+        with rt["client"].lock:
+            joint_check_account(rt, owner_sid, grant["username"])
+            try:
+                snapshot = authorize_entry(rt["client"], contest_id, grant["fingerprint"],
+                                           grant["action"], grant["values"])
+                joint_check_account(rt, owner_sid, grant["username"])
+                if snapshot.get("entry_uncertain"):
+                    rt["entry_notice"] = ("vp", grant["username"], snapshot.get("message", "请刷新核查参赛状态。"))
+                return snapshot
+            finally:
+                # Normal /api/state still owns the clock, standings and local run.
+                rt.update(loaded=False, contest=None, problems={})
+                statement_cache.invalidate(owner_sid)
+
+    joint_vp = JointVPService(data_dir / "vp.sqlite3", contest_key,
+                              joint_observe, joint_prepare, joint_launch)
+    app.extensions["joint_vp"] = joint_vp
+
+    def guard_joint_mutation(*, start=False):
+        scheduled_vp.guard(g.owner_sid)
+        if g.team and g.role == "captain":
+            joint_vp.guard_mutation(g.team, start=start)
+
+    def runtime():
+        cli = getattr(g, "cli", None)
+        if cli is not None:
+            sid = cli["owner_sid"]
+        elif "sid" not in session:
+            session["sid"] = secrets.token_urlsafe(32)
+            session["csrf"] = secrets.token_urlsafe(32)
+            session.permanent = True
+            sid = session["sid"]
+        else:
+            sid = session["sid"]
+        g.team = teams.access(sid, contest_key)
+        g.role = g.team["role"] if g.team else "solo"
+        if cli is not None and (not g.team or g.role != "captain" or g.team["id"] != cli["team_id"]
+                                or g.team["owner_sid"] != sid):
+            raise CLIAuthError("终端授权绑定的队长设备已失效，请重新配置。")
+        g.owner_sid = g.team["owner_sid"] if g.team and g.role != "revoked" else sid
+        with registry_lock:
+            sid = g.owner_sid
+            if sid not in clients:
+                client = factory()
+                client.scoreboard_mode = scoreboard
+                client.show_unofficial = show_unofficial
+                clients[sid] = {"client": client, "contest": None, "contest_error": None, "contest_error_status": None,
+                                "loaded": False, "problems": {}, "last_poll": 0,
+                                "state_lock": threading.Lock(), "state_job": None, "state_snapshot": None}
+            return clients[sid]
+
+    @app.before_request
+    def protect_mutations():
+        if "Authorization" in request.headers:
+            match = re.fullmatch(r"Bearer ([A-Za-z0-9_-]+)", request.headers["Authorization"], re.I)
+            if not match:
+                raise CLIAuthError("Authorization 须使用有效的 Bearer 终端授权。")
+            g.cli = cli_tokens.authorize(match[1], contest_key)
+            readable = request.method == "GET" and (request.path in {"/api/state", "/api/prints"}
+                                                        or re.fullmatch(r"/api/problems/\d+", request.path))
+            writable = request.method == "POST" and request.path in {"/api/submit", "/api/prints"}
+            if not readable and not writable:
+                raise AppError("此终端授权仅用于读取参赛状态、提交代码和虚拟打印。", 403)
+            origin = request.headers.get("Origin")
+            if origin and origin != request.host_url.rstrip("/"):
+                raise AppError("请求来源不匹配，请使用当前服务地址。", 403)
+        if request.path.startswith("/static/"):
+            return
+        g.runtime = runtime()
+        if getattr(g, "cli", None) is not None and not demo and not g.runtime["client"].authenticated:
+            raise AppError("QOJ 账号尚未连接或连接已失效；请在队长网页连接账号后重试。", 401)
+        # Device roles come from persistent server records, never client flags.
+        if g.role in {"member", "revoked"}:
+            common = (request.method in {"GET", "HEAD"} and request.path in {"/", "/healthz", "/api/state", "/api/team"}) or (request.method == "POST" and request.path == "/api/team/leave")
+            readable = g.role == "member" and request.method in {"GET", "HEAD"} and (
+                request.path == "/api/joint-vp"
+                or re.fullmatch(r"/api/problems/\d+(?:/statement|/pdf/[a-f0-9]{24})?", request.path)
+                or re.fullmatch(r"/api/prints(?:/[a-f0-9]{32}/(?:view|download))?", request.path)
+                or request.path.startswith("/qoj/"))
+            if not common and not readable:
+                raise AppError("此设备只有查看权限；该操作须在队长机上进行。", 403)
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            origin = request.headers.get("Origin")
+            if origin and origin != request.host_url.rstrip("/"):
+                raise AppError("请求来源不匹配，请从当前服务页面操作。", 403)
+            if request.path.startswith("/api/"):
+                if getattr(g, "cli", None) is None and not hmac.compare_digest(request.headers.get("X-CSRF-Token", ""), session["csrf"]):
+                    raise AppError("页面会话已过期，请刷新后重试。", 403)
+                if not request.is_json and not (request.path == "/api/prints" and request.mimetype == "multipart/form-data"):
+                    raise AppError("请求必须使用 JSON。", 415)
+            elif request.path.startswith("/qoj"):
+                referer = request.headers.get("Referer", "")
+                if not origin and urlsplit(referer).netloc != request.host:
+                    raise AppError("请从代理登录页提交表单。", 403)
+
+    @app.after_request
+    def response_headers(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "same-origin"
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
+        if not request.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.errorhandler(AppError)
+    @app.errorhandler(QOJError)
+    @app.errorhandler(TeamError)
+    @app.errorhandler(PrintError)
+    @app.errorhandler(CLIAuthError)
+    @app.errorhandler(JointVPError)
+    @app.errorhandler(ScheduleError)
+    def known_error(exc):
+        details = {"error": str(exc)}
+        if getattr(exc, "code", None):
+            details["code"] = exc.code
+        return jsonify(details), exc.status
+
+    @app.errorhandler(HTTPException)
+    def http_error(exc):
+        return jsonify(error=exc.description), exc.code
+
+    def payload():
+        body = request.get_json()
+        if not isinstance(body, dict):
+            raise AppError("请求必须是 JSON 对象。")
+        return body
+
+    def participation_mode():
+        return store.participation_mode(g.owner_sid, contest_key, mode)
+
+    def invalidate_native():
+        statement_cache.invalidate(g.owner_sid)
+        g.runtime.update(loaded=False, contest=None, problems={})
+        with g.runtime["state_lock"]:
+            g.runtime["state_snapshot"] = None
+            g.runtime.pop("validation_snapshot", None)
+        g.pop("native_snapshot", None)
+        g.pop("native_run", None)
+
+    def native_snapshot(force=False):
+        """One fresh upstream observation per HTTP request; errors revoke cached content."""
+        if not force and hasattr(g, "native_snapshot"):
+            return g.native_snapshot
+        rt = g.runtime
+        selected_mode = participation_mode()
+        try:
+            if not callable(getattr(rt["client"], "participation", None)):
+                raise AppError("QOJ 适配器不支持原生参赛状态。", 502)
+            with rt["client"].lock:
+                reader = rt["client"].participation
+                validation = getattr(g, "native_validation", False)
+                if validation or xcpcio_board is not None:
+                    reader = getattr(rt["client"], "participation_for_submission", reader)
+                snapshot = dict(reader(contest_id, selected_mode))
+                if snapshot.get("mode", selected_mode) != selected_mode:
+                    raise AppError("QOJ 返回了不同参赛模式的状态，请刷新连接。", 502)
+                snapshot["mode"] = selected_mode
+                entry_notice = rt.get("entry_notice")
+                if entry_notice and entry_notice[:2] == (selected_mode, rt["client"].username):
+                    if snapshot.get("status") in {"scheduled", "running", "finished"}:
+                        rt.pop("entry_notice", None)
+                    else:
+                        snapshot.update(entry_uncertain=True, message=entry_notice[2])
+                visible = (bool(snapshot.get("content_available")) and rt["client"].authenticated
+                           and snapshot.get("status") in {"running", "finished"})
+                snapshot["content_available"] = visible
+                snapshot["can_submit"] = bool(snapshot.get("can_submit")) and snapshot.get("status") == "running" and visible
+                contest = snapshot.get("contest")
+                if visible and contest is None:
+                    contest = rt["client"].contest(contest_id)
+                if not visible:
+                    contest = {"id": contest_id, "title": f"QOJ Contest #{contest_id}", "duration_seconds": 0,
+                               "problems": [], "attachments": []}
+                    snapshot["scoreboard"] = []
+                    snapshot["scoreboard_problem_totals"] = {}
+                elif not isinstance(contest, dict) or not isinstance(contest.get("problems"), list):
+                    raise AppError("无法确认 QOJ 当前比赛的题目列表。", 502)
+                snapshot["contest"] = contest
+                if xcpcio_board is not None and visible and not validation:
+                    # Never briefly publish QOJ's final standings as a replay.
+                    snapshot.update(scoreboard=[], scoreboard_source='xcpcio', scoreboard_available=False,
+                                    scoreboard_status='unavailable', scoreboard_message='正在读取 XCPCIO 现场榜单…')
+                scope = (selected_mode, rt["client"].username, snapshot.get("started_at"), visible)
+                if rt.get("native_scope") != scope:
+                    rt["problems"].clear()
+                    statement_cache.invalidate(g.owner_sid)
+                rt.update(native_scope=scope, contest=contest, loaded=True, contest_error=None, contest_error_status=None)
+                g.native_snapshot = snapshot
+                if xcpcio_board is None or not visible or validation:
+                    publish_snapshot(snapshot, validation=validation)
+                g.pop("native_run", None)
+                return snapshot
+        except (QOJError, AppError) as exc:
+            invalidate_native()
+            rt.update(contest_error=str(exc), contest_error_status=exc.status)
+            g.native_snapshot = {"mode": selected_mode, "status": "unavailable", "content_available": False,
+                                 "can_submit": False, "started_at": None, "ends_at": None, "actions": [],
+                                 "scoreboard": [], "message": str(exc), "error_status": exc.status}
+            publish_snapshot(g.native_snapshot)
+            return g.native_snapshot
+
+    def publish_snapshot(snapshot, validation=False):
+        rt = g.runtime
+        with rt["state_lock"]:
+            rt["validation_snapshot" if validation else "state_snapshot"] = (participation_mode(), rt["client"].username,
+                                    rt["client"].authenticated, time.monotonic(), deepcopy(snapshot))
+
+    def recent_native_snapshot():
+        """Short read-only lease; submission always revalidates before its POST."""
+        rt = g.runtime
+        with rt["state_lock"]:
+            candidates = [rt.get(key) for key in ("state_snapshot", "validation_snapshot")]
+            cached = max((item for item in candidates if item), key=lambda item: item[3], default=None)
+            if not cached or cached[:3] != (participation_mode(), rt["client"].username,
+                                            rt["client"].authenticated):
+                return False
+            age = time.monotonic() - cached[3]
+            if age >= 8:
+                return False
+            snapshot = deepcopy(cached[4])
+        if not snapshot.get("content_available") or not snapshot.get("can_submit"):
+            return False
+        now = (snapshot.get("server_time") or time.time()) + age
+        if snapshot.get("ends_at") is not None and now >= snapshot["ends_at"]:
+            return False
+        snapshot["server_time"] = now
+        g.native_snapshot = snapshot
+        return True
+
+    def refresh_state_background():
+        """Single upstream refresh per owner; never cache device permissions or CSRF."""
+        rt, owner, team, role = g.runtime, g.owner_sid, g.team, g.role
+        if (scheduled_vp.view(owner) or {}).get('status') in {'pending', 'starting'}:
+            # Do not hold the QOJ lock with background polling ahead of a timed start.
+            with rt['state_lock']:
+                cached = rt.get('state_snapshot')
+                valid = cached and cached[:3] == (participation_mode(), rt['client'].username, rt['client'].authenticated)
+                g.native_snapshot = deepcopy(cached[4]) if valid else dict(mode='vp', status='unregistered',
+                    content_available=False, can_submit=False, actions=[], scoreboard=[])
+            g.background_state = True
+            return False
+        with rt["state_lock"]:
+            done = rt["state_job"]
+            if done is None:
+                done = threading.Event()
+                rt["state_job"] = done
+
+                def refresh():
+                    try:
+                        with app.app_context():
+                            g.runtime, g.owner_sid, g.team, g.role = rt, owner, team, role
+                            with rt["client"].lock:
+                                if (scheduled_vp.view(owner) or {}).get('status') in {'pending', 'starting'}:
+                                    return
+                                snapshot = native_snapshot()
+                                if snapshot.get("content_available"):
+                                    run = current_run()
+                                    if run:
+                                        poll(run)
+                                        reader = getattr(rt['client'], 'contest_submissions', None)
+                                        if callable(reader):
+                                            try:
+                                                snapshot['external_submissions'] = reader(contest_id, snapshot)
+                                            except QOJError as exc:
+                                                if exc.status in (401, 403, 409):
+                                                    raise
+                                                snapshot['submission_sync_error'] = str(exc)
+                                            except Exception:
+                                                app.logger.exception('QOJ submission sync failed')
+                                                snapshot['submission_sync_error'] = 'QOJ 提交记录暂时无法同步，请稍后刷新。'
+                                            if xcpcio_board is None:
+                                                publish_snapshot(snapshot)
+                                        if xcpcio_board is not None:
+                                            try:
+                                                if snapshot.get('submission_sync_error'):
+                                                    raise XCPCIOError(snapshot['submission_sync_error'])
+                                                all_submissions = merge_submissions(store.submissions(run['id']), snapshot.get('external_submissions', []))
+                                                display_name = g.team['name'] if g.team else run['team_name']
+                                                snapshot.update(xcpcio_board.project(snapshot, all_submissions, display_name))
+                                            except (XCPCIOError, KeyError, TypeError, ValueError) as exc:
+                                                snapshot.update(scoreboard=[], scoreboard_source='xcpcio', scoreboard_available=False,
+                                                                scoreboard_status='error', scoreboard_message='XCPCIO 榜单无法显示：' + str(exc))
+                                            publish_snapshot(snapshot)
+                    except (QOJError, AppError) as exc:
+                        # Preserve synchronous authorization failures when the
+                        # observation finishes inside the short response budget.
+                        done.error = exc
+                        with rt["state_lock"]:
+                            rt["state_snapshot"] = None
+                    except Exception:
+                        app.logger.exception("Background QOJ state refresh failed")
+                        with rt["state_lock"]:
+                            rt["state_snapshot"] = None
+                    finally:
+                        with rt["state_lock"]:
+                            rt["state_job"] = None
+                        done.set()
+
+                threading.Thread(target=refresh, name="qoj-state-refresh", daemon=True).start()
+        # Fast upstreams can return fresh data immediately; slow ones cannot hold
+        # browser/CLI reads hostage for the full network timeout.
+        done.wait(0.15)
+        if done.is_set() and getattr(done, "error", None) is not None:
+            raise done.error
+        with rt["state_lock"]:
+            cached = rt["state_snapshot"]
+            snapshot = deepcopy(cached[4]) if (cached and cached[:3] == (
+                participation_mode(), rt["client"].username, rt["client"].authenticated)
+                and time.monotonic() - cached[3] < 60) else None
+        if snapshot is None:
+            snapshot = {"mode": participation_mode(), "status": "unavailable", "content_available": False,
+                        "can_submit": False, "actions": [], "scoreboard": [],
+                        "message": "正在后台确认 QOJ 参赛状态，请稍后刷新。"}
+        # Advance upstream clock while serving an older observation.
+        if cached and snapshot.get("server_time"):
+            snapshot["server_time"] += max(0, time.monotonic() - cached[3])
+        end = snapshot.get("ends_at")
+        if isinstance(end, (int, float)) and (snapshot.get("server_time") or time.time()) >= end:
+            snapshot["can_submit"] = False
+        g.native_snapshot = snapshot
+        g.background_state = True
+        return not done.is_set()
+
+    def require_content():
+        if not demo:
+            snapshot = native_snapshot()
+            if not snapshot.get("content_available"):
+                raise AppError(snapshot.get("message") or "比赛尚未开始，比赛内容暂不可访问。",
+                               snapshot.get("error_status") or 403)
+
+    def native_run():
+        if hasattr(g, "native_run"):
+            return g.native_run
+        snapshot = native_snapshot()
+        start, end = snapshot.get("started_at"), snapshot.get("ends_at")
+        username = g.runtime["client"].username
+        valid_times = all(isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t)
+                          for t in (start, end))
+        if not snapshot.get("content_available") or not username or not valid_times or end <= start:
+            g.native_run = None
+            return None
+        # Account and upstream start identify the run across refresh/restart.
+        key = json.dumps([snapshot["mode"], username, start], ensure_ascii=True, separators=(",", ":"))
+        name = g.team["name"] if g.team else username
+        g.native_run = store.sync_native_run(g.owner_sid, contest_key, key, name, start, end,
+                                            finished=snapshot["status"] == "finished")
+        return g.native_run
+
+    def load_contest(force=False):
+        rt = g.runtime
+        if not demo:
+            native_snapshot(force=force)
+            return rt["contest"]
+        if force or not rt["loaded"]:
+            rt["loaded"] = True
+            try:
+                contest = rt["client"].contest(contest_id)
+                if not contest.get("problems"):
+                    raise AppError("没有找到可访问的比赛题目，请检查比赛 ID 和账号权限。", 502)
+                if duration_minutes is not None:
+                    contest["duration_seconds"] = duration_minutes * 60
+                contest["duration_seconds"] = max(60, int(contest.get("duration_seconds") or 18000))
+                rt["contest"] = contest
+                rt["contest_error"] = None
+                rt["contest_error_status"] = None
+                rt["problems"].clear()
+                statement_cache.invalidate(g.owner_sid)
+            except (QOJError, AppError) as exc:
+                rt["contest_error"] = str(exc)
+                rt["contest_error_status"] = exc.status
+        return rt["contest"]
+
+    def require_contest():
+        contest = load_contest()
+        if not contest or g.runtime["contest_error"]:
+            raise AppError(g.runtime["contest_error"] or "比赛尚未加载。", 409)
+        return contest
+
+    def contest_attachments(force=False):
+        if not demo and force:
+            native_snapshot(force=True)
+        require_content()
+        contest = load_contest(force=force and demo)
+        if not contest or g.runtime["contest_error"]:
+            raise AppError(g.runtime["contest_error"] or "比赛尚未加载。",
+                           g.runtime["contest_error_status"] or 409)
+        return contest.get("attachments", [])
+
+    def find_problem(problem_id):
+        require_content()
+        contest = require_contest()
+        p = next((p for p in contest["problems"] if p["id"] == problem_id), None)
+        if p is None:
+            raise AppError("该题目不属于当前比赛。", 404)
+        return p
+
+    def problem_info(problem_id, force=False):
+        p = find_problem(problem_id)
+        rt = g.runtime
+        if force:
+            rt["problems"].pop(problem_id, None)
+            statement_cache.invalidate(g.owner_sid, problem_id)
+        if problem_id not in rt["problems"]:
+            rt["problems"][problem_id] = rt["client"].problem(contest_id, problem_id)
+        return {**p, **rt["problems"][problem_id], "label": p["label"]}
+
+    def current_run():
+        if not demo:
+            return native_run()
+        return store.current(g.owner_sid, contest_key)
+
+    def public_team():
+        team = g.team
+        if not team:
+            return None
+        devices = team["devices"] if g.role != "revoked" else []
+        result = {"id": team["id"], "name": team["name"], "role": g.role,
+                  "device_id": team["device_id"], "device_name": team["device_name"],
+                  "devices": devices, "member_count": sum(d["role"] == "member" for d in devices),
+                  "max_members": 2}
+        if g.role == "captain" and getattr(g, "cli", None) is None:
+            result["join_code"] = team["join_code"]
+        return result
+
+    def active_run():
+        if not demo:
+            snapshot = native_snapshot()
+            if not snapshot.get("can_submit"):
+                raise AppError(snapshot.get("message") or "QOJ 当前未允许参赛提交。", snapshot.get("error_status") or 409)
+            run = native_run()
+            if run is None:
+                raise AppError("无法确认 QOJ 本轮参赛时间，暂不能提交或打印；请刷新连接。", 409)
+            return run
+        run = current_run()
+        if not run or run["finished_at"] is not None or time.time() >= run["ends_at"]:
+            raise AppError("VP 尚未开始或已结束，请先开始新一轮 VP。", 409)
+        return run
+
+    def submission_retry_delay(exc):
+        delay = 60 if exc.status == 429 else 30 if exc.status >= 500 else 0
+        retry_after = getattr(exc, "retry_after", None)
+        if (isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool)
+                and math.isfinite(retry_after) and retry_after >= 0):
+            delay = max(delay, retry_after)
+        return delay
+
+    def poll(run):
+        now = time.time()
+        if now - g.runtime["last_poll"] < (1 if demo else 8):
+            return
+        g.runtime["last_poll"] = now
+        client = g.runtime["client"]
+        expected_username = client.username
+        submissions = store.submissions(run["id"])
+        excluded = {sub["qoj_id"] for sub in submissions if sub["qoj_id"] is not None}
+        checked = 0
+        for sub in sorted(submissions, key=lambda s: s["checked_at"]):
+            if sub["verdict"] not in {"PENDING", "UNKNOWN"}:
+                continue
+            if now < sub["next_poll_at"]:
+                continue
+            if demo:
+                if now - sub["submitted_at"] >= 2:
+                    store.update_submission(sub["id"], verdict="AC", checked_at=now,
+                                            message="演示结果：模拟 AC，未编译或执行代码。")
+            elif now - sub["checked_at"] >= 8:
+                receipt = None
+                reconciler = getattr(client, "reconcile_submission", None)
+                if sub["qoj_id"] is None:
+                    saved = store.submission_payload(sub["id"])
+                    receipt = saved["receipt"] if saved else None
+                    if sub["verdict"] != "UNKNOWN" or receipt is None or not callable(reconciler):
+                        continue
+                # Keep page refresh latency bounded; rotate fairly through a queue.
+                if checked >= 1:
+                    break
+                checked += 1
+                try:
+                    qoj_id = sub["qoj_id"]
+                    if qoj_id is None:
+                        recovered = reconciler(contest_id, sub["problem_id"], sub["language"], receipt,
+                                               exclude_ids=tuple(sorted(excluded)))
+                        if client.username != expected_username:
+                            raise QOJError("QOJ 账号在确认提交编号时发生变化，请重新连接后刷新。", 409)
+                        qoj_id = recovered.get("qoj_id")
+                        if qoj_id is None:
+                            store.update_submission(sub["id"], checked_at=now,
+                                                    next_poll_at=0,
+                                                    message=recovered.get("message") or "尚未唯一确认 QOJ 提交编号，将继续只读核查。")
+                            continue
+                        if isinstance(qoj_id, bool) or not isinstance(qoj_id, int) or qoj_id <= 0 or qoj_id in excluded:
+                            raise QOJError("QOJ 返回的提交编号无效或已关联其它提交，暂不绑定。", 502)
+                        # Persist the confirmed ID before fetching its verdict,
+                        # so a later network failure does not lose the binding.
+                        store.update_submission(sub["id"], qoj_id=qoj_id,
+                                                qoj_url=f"https://qoj.ac/submission/{qoj_id}", verdict="PENDING",
+                                                message=recovered.get("message", ""))
+                        excluded.add(qoj_id)
+                    result = client.verdict(qoj_id)
+                    if client.username != expected_username:
+                        raise QOJError("QOJ 账号在读取评测结果时发生变化，请重新连接后刷新。", 409)
+                    store.update_submission(sub["id"], verdict=result["verdict"],
+                                            message=result.get("message", ""), checked_at=now, next_poll_at=0,
+                                            time_text=result.get("time_text", ""), memory_text=result.get("memory_text", ""))
+                except QOJError as exc:
+                    delay = submission_retry_delay(exc)
+                    store.update_submission(sub["id"], message=str(exc), checked_at=now,
+                                            next_poll_at=now + delay if delay else 0)
+                    if exc.status in (401, 409):
+                        invalidate_native()
+                        raise
+
+    def display_scoreboard(result, snapshot):
+        """Redact the public board after keeping only this team's private details."""
+        if g.team:
+            result['scoreboard'] = [dict(row, team_name=g.team['name']) if row.get('is_self') is True
+                                    else row for row in result.get('scoreboard', [])]
+        result['scheduled_vp'] = scheduled_vp.view(g.owner_sid) if g.role in {'solo', 'captain'} else None
+        if snapshot.get('scoreboard_display', {}).get('style') == 'ccpc26':
+            result['scoreboard_display'] = snapshot['scoreboard_display']
+        if ccpc_board is None:
+            return result
+        result["scoreboard_display"] = {"style": "ccpc"}
+        participant = result.get("participation")
+        # Never send raw header totals alongside anonymized cells. Revealed
+        # totals are computed over the same visible roster as the thresholds.
+        if participant is not None:
+            participant["scoreboard_problem_totals"] = {}
+        if (not snapshot.get("content_available")
+                or snapshot.get("status") not in {"running", "finished"}):
+            result["scoreboard"] = []
+            return result
+        if snapshot.get("scoreboard_available") is False:
+            result["scoreboard"] = []
+            return result
+        source = snapshot.get("scoreboard_source", "demo" if demo else "qoj")
+        visibility = show_unofficial
+        if source == "qoj" and show_unofficial is None:
+            cookies = getattr(getattr(g.runtime["client"], "session", None), "cookies", ())
+            visibility = sorted((cookie.domain, cookie.path, cookie.value) for cookie in cookies
+                                if cookie.name == "show_unofficial_mode")
+        scope = json.dumps([contest_key, g.owner_sid, snapshot.get("username"),
+                            snapshot.get("mode"), snapshot.get("started_at"), snapshot.get("ends_at"),
+                            source, visibility], ensure_ascii=True, separators=(",", ":"))
+        try:
+            projected = ccpc_board.project(
+                result["scoreboard"], result["contest"].get("problems", []), scope=scope,
+                now=result["server_time"], started_at=snapshot.get("started_at"),
+                finished=snapshot.get("status") == "finished", demo=demo,
+                freeze_at=snapshot.get("scoreboard_freeze_at"),
+                frozen=snapshot.get("scoreboard_frozen") is True,
+                ruleset=snapshot.get("ruleset"), source=source,
+                published_totals=snapshot.get("scoreboard_problem_totals"),
+            )
+        except ValueError as exc:
+            # Invalid configuration/data must not fall back to the original
+            # unredacted table. The rest of participation remains usable.
+            result["scoreboard"] = []
+            result["scoreboard_display"]["error"] = str(exc)
+            if participant is not None:
+                participant.update(scoreboard_available=False, scoreboard_status="error",
+                                   scoreboard_message="CCPC 榜单无法显示：" + str(exc))
+            else:
+                result["scoreboard_message"] = "CCPC 榜单无法显示：" + str(exc)
+            return result
+        result["scoreboard"] = projected["rows"]
+        result["scoreboard_display"] = projected["meta"]
+        if participant is not None:
+            participant["scoreboard_problem_totals"] = {
+                str(problem["id"]): {"solved": problem["solved"], "submissions": problem["submissions"]}
+                for problem in projected["meta"]["revealed_problems"]
+            }
+        return result
+
+    def state():
+        rt = g.runtime
+        can_manage = g.role in {"solo", "captain"}
+        csrf_token = "" if getattr(g, "cli", None) is not None else session["csrf"]
+        if g.role == "revoked":
+            return {"csrf_token": csrf_token, "demo": demo, "server_time": time.time(),
+                    "contest": {"id": contest_id, "title": "设备已离开队伍", "duration_seconds": 0, "problems": []},
+                    "contest_error": "队长已移除此设备，请退出后使用新的加入码加入。",
+                    "user": {"authenticated": False, "username": ""}, "run": None,
+                    "submissions": [], "scoreboard": [], "poll_interval": 8,
+                    "team": public_team(), "permissions": {"manage": False, "submit": False, "print": False, "view_content": False},
+                    "participation": {"mode": participation_mode(), "status": "unavailable", "content_available": False, "actions": []}}
+        if not demo:
+            snapshot = native_snapshot()
+            visible = snapshot.get("content_available", False)
+            contest = snapshot.get("contest") or {"id": contest_id, "title": f"QOJ Contest #{contest_id}",
+                                                   "duration_seconds": 0, "problems": []}
+            board = snapshot.get("scoreboard", []) if visible else []
+            run = current_run() if visible else None
+            submissions = []
+            if run:
+                if not getattr(g, "background_state", False):
+                    poll(run)
+                submissions = merge_submissions(store.submissions(run["id"]), snapshot.get('external_submissions', []))
+                own_row = next((row for row in board if row.get("is_self")), {})
+                run = {k: v for k, v in run.items() if k not in {"sid", "contest_key", "upstream_key", "freeze_seconds"}}
+                run.update(status=snapshot["status"], mode=snapshot["mode"],
+                           solved=own_row.get("solved"), penalty=own_row.get("penalty"),
+                           problem_stats=own_row.get("problem_stats", {}))
+            participant = {k: v for k, v in snapshot.items() if k not in {"contest", "scoreboard", "error_status", "external_submissions"}}
+            allowed = can_manage and snapshot.get("can_submit", False) and run is not None
+            result = {"csrf_token": csrf_token, "demo": False, "server_time": snapshot.get("server_time") or time.time(),
+                    "contest": contest if can_manage else {k: v for k, v in contest.items() if k != "attachments"},
+                    "contest_error": rt["contest_error"], "user": {"authenticated": rt["client"].authenticated,
+                    "username": rt["client"].username}, "run": run, "submissions": submissions if can_manage else [],
+                    "scoreboard": board, "participation": participant, "poll_interval": 8, "team": public_team(),
+                    "permissions": {"manage": can_manage, "submit": allowed, "print": allowed, "view_content": visible}}
+            return display_scoreboard(result, snapshot)
+        contest = load_contest() or {"id": contest_id, "title": f"QOJ Contest #{contest_id}",
+                                   "duration_seconds": (duration_minutes or 300) * 60, "problems": []}
+        run = current_run()
+        submissions = []
+        if run:
+            poll(run)
+            submissions = store.submissions(run["id"])
+            run = {k: v for k, v in run.items() if k not in {"sid", "contest_key"}}
+            run["status"] = "finished" if run["finished_at"] is not None or time.time() >= run["ends_at"] else "running"
+            run.update(score(contest["problems"], submissions))
+        board = store.scoreboard(contest_key, g.owner_sid, contest["problems"])
+        own_row = next((row for row in board if row["is_self"]), None)
+        freeze_at = own_row.get("freeze_at") if own_row else None
+        unfreeze_at = own_row.get("unfreeze_at") if own_row else None
+        freeze_status = ("frozen" if own_row and own_row.get("frozen") else
+                         "unfrozen" if unfreeze_at is not None and time.time() >= unfreeze_at else
+                         "scheduled" if freeze_at is not None else "disabled")
+        result = {"csrf_token": csrf_token, "demo": demo, "server_time": time.time(),
+                "contest": contest if can_manage else {k: v for k, v in contest.items() if k != "attachments"}, "contest_error": rt["contest_error"],
+                "user": {"authenticated": rt["client"].authenticated, "username": rt["client"].username},
+                "run": run, "submissions": submissions if can_manage else [],
+                "scoreboard": board,
+                "scoreboard_freeze": {"status": freeze_status, "freeze_at": freeze_at, "unfreeze_at": unfreeze_at,
+                                      "frozen_teams": sum(bool(row.get("frozen")) for row in board),
+                                      "configured_minutes": freeze_minutes, "auto_unfreeze": True},
+                "poll_interval": 8, "team": public_team(),
+                "permissions": {"manage": can_manage, "submit": can_manage, "print": can_manage, "view_content": True}}
+        return display_scoreboard(result, {
+            "mode": "vp", "username": rt["client"].username, "content_available": run is not None,
+            "status": run["status"] if run else "unregistered", "ruleset": "ICPC", "scoreboard_source": "demo",
+            "started_at": run["started_at"] if run else None, "ends_at": run["ends_at"] if run else None,
+            "scoreboard_freeze_at": freeze_at, "scoreboard_frozen": freeze_status == "frozen",
+        })
+
+    @app.get("/")
+    def index():
+        return send_from_directory(app.static_folder, "index.html")
+
+    @app.get("/healthz")
+    def health():
+        result = dict(status="ok", contest_id=contest_id, demo=demo,
+                      xcpcio_url=xcpcio_board.url if xcpcio_board else None, vp_rule=vp_rule)
+        if "VP_LAUNCH_ID" in app.config:
+            result["launch_id"] = app.config["VP_LAUNCH_ID"]
+        return jsonify(result)
+
+    @app.post('/api/schedule/prepare')
+    def prepare_schedule():
+        if demo or not g.team or g.role != 'captain' or participation_mode() != 'vp':
+            raise AppError('请先创建队伍、连接 QOJ 并选择 VP 模式。', 409)
+        with g.runtime['client'].lock:
+            guard_joint_mutation(start=True)
+            plan = prepare_entry(g.runtime['client'], contest_id)
+            g.runtime['schedule_plan'] = deepcopy(plan)
+            g.runtime['schedule_account'] = g.runtime['client'].username
+            return jsonify(plan=plan)
+
+    @app.get('/api/schedule/status')
+    def schedule_status():
+        return jsonify(scheduled_vp=scheduled_vp.view(g.owner_sid), server_time=time.time())
+
+    @app.post('/api/schedule')
+    def schedule_start():
+        body = payload()
+        if demo or not g.team or g.role != 'captain' or participation_mode() != 'vp':
+            raise AppError('定时开赛须由已创建队伍的队长在 VP 模式操作。', 403)
+        if body.get('consent') is not True:
+            raise AppError('请确认授权在指定时间开始 QOJ VP。')
+        with g.runtime['client'].lock:
+            guard_joint_mutation(start=True)
+            plan = g.runtime.get('schedule_plan')
+            if not plan or plan['fingerprint'] != body.get('fingerprint'):
+                raise AppError('开赛表单已变化，请重新设置定时 VP。', 409)
+            joint_check_account(g.runtime, g.owner_sid, g.runtime.get('schedule_account'))
+            validate_preparation(plan, body.get('action'), body.get('values'))
+            binding = dict(team_id=g.team['id'], username=g.runtime['client'].username,
+                           fingerprint=plan['fingerprint'], action=body['action'], values=body['values'])
+            return jsonify(scheduled_vp=scheduled_vp.schedule(g.owner_sid, body.get('target'), binding))
+
+    @app.post('/api/schedule/cancel')
+    def cancel_schedule():
+        return jsonify(scheduled_vp=scheduled_vp.cancel(g.owner_sid))
+
+    @app.get("/api/state")
+    def get_state():
+        if not demo and getattr(g, "cli", None) is not None:
+            # CLI only needs its own run, problem labels and verdicts. Do not
+            # start another full standings refresh immediately before submitting.
+            g.native_validation = True
+            with g.runtime["client"].lock:
+                recent_native_snapshot()
+                return jsonify(state())
+        if not demo and g.role != "revoked":
+            refreshing = refresh_state_background()
+            result = state()
+            result["state_refreshing"] = refreshing
+            return jsonify(result)
+        with g.runtime["client"].lock:
+            return jsonify(state())
+
+    @app.get("/api/team")
+    def get_team():
+        return jsonify(team=public_team())
+
+    @app.get("/api/joint-vp")
+    def get_joint_vp():
+        if demo or not g.team or g.role not in {"captain", "member"}:
+            return jsonify(joint_vp=None)
+        return jsonify(joint_vp=joint_vp.view(g.team, captain=g.role == "captain")["room"])
+
+    @app.post("/api/joint-vp/<operation>")
+    def change_joint_vp(operation):
+        body = payload()
+        if demo:
+            raise AppError("联合 VP 用于 QOJ 原生参赛，离线演示不启动上游。", 409)
+        if not g.team or g.role != "captain" or g.team["owner_sid"] != g.owner_sid:
+            raise AppError("请先创建队伍；联合 VP 操作须由队长完成。", 403)
+        if operation in {"create", "join", "prepare", "ready", "start"} and participation_mode() != "vp":
+            raise AppError("联合 VP 仅支持虚拟参赛，请先切换参赛模式。", 409)
+        actions = {
+            "create": lambda: joint_vp.create(g.team),
+            "join": lambda: joint_vp.join(g.team, body.get("code")),
+            "prepare": lambda: joint_vp.prepare(g.team),
+            "unready": lambda: joint_vp.unready(g.team),
+            "start": lambda: joint_vp.start(g.team),
+            "refresh": lambda: joint_vp.refresh(g.team),
+            "leave": lambda: joint_vp.leave(g.team),
+            "cancel": lambda: joint_vp.cancel(g.team),
+        }
+        if operation == "ready":
+            if body.get("consent") is not True:
+                raise AppError("请确认报名选项并授权组织者启动本次 VP。", 400)
+            result = joint_vp.ready(g.team, body.get("fingerprint"), body.get("action"), body.get("values"))
+        elif operation in actions:
+            result = actions[operation]()
+        else:
+            raise AppError("未知的联合 VP 操作。", 404)
+        return jsonify(joint_vp=result["room"]), 202 if operation == "start" else 200
+
+    def require_cli_captain():
+        if not g.team or g.role != "captain" or g.team["owner_sid"] != g.owner_sid:
+            raise AppError("请先在本机创建队伍；只有队长机可以管理终端授权。", 403)
+
+    @app.get("/api/cli")
+    def get_cli():
+        require_cli_captain()
+        return jsonify(cli_tokens.status(g.owner_sid, g.team["id"], contest_key))
+
+    @app.post("/api/cli/token")
+    def issue_cli_token():
+        payload()
+        require_cli_captain()
+        issued = cli_tokens.issue(g.owner_sid, g.team["id"], contest_key)
+        return jsonify(config={"version": 1, "server_url": request.host_url.rstrip("/"),
+                               "token": issued["token"], "contest_id": contest_id,
+                               "team_id": g.team["id"], "team_name": g.team["name"]},
+                       created_at=issued["created_at"])
+
+    @app.post("/api/cli/revoke")
+    def revoke_cli_token():
+        payload()
+        require_cli_captain()
+        return jsonify(cli_tokens.revoke(g.owner_sid, g.team["id"], contest_key))
+
+    def rebound_state():
+        g.runtime = runtime()
+        with g.runtime["client"].lock:
+            return jsonify(state())
+
+    @app.post("/api/team/create")
+    def create_team():
+        body = payload()
+        teams.create(session["sid"], contest_key, body.get("name", "My Team"), body.get("device_name", "队长机"))
+        return rebound_state()
+
+    @app.post("/api/team/join")
+    def join_team():
+        body = payload()
+        if demo and not g.team:
+            run = current_run()
+            if run and run["finished_at"] is None and time.time() < run["ends_at"]:
+                raise AppError("请先结束当前独立 VP，再加入队伍。", 409)
+        teams.join(session["sid"], contest_key, body.get("code"), body.get("device_name", "队员机"))
+        return rebound_state()
+
+    @app.post("/api/team/rotate")
+    def rotate_team():
+        teams.rotate(session["sid"], contest_key)
+        return rebound_state()
+
+    @app.post("/api/team/revoke")
+    def revoke_device():
+        teams.revoke(session["sid"], contest_key, payload().get("device_id"))
+        return rebound_state()
+
+    @app.post("/api/team/leave")
+    def leave_team():
+        teams.leave(session["sid"], contest_key)
+        session.clear()
+        return rebound_state()
+
+    @app.post("/api/team/dissolve")
+    def dissolve_team():
+        payload()
+        if g.team and g.role == "captain":
+            joint_vp.detach(g.team)
+        teams.dissolve(session["sid"], contest_key)
+        return rebound_state()
+
+    @app.post("/api/refresh")
+    def refresh():
+        with g.runtime["client"].lock:
+            load_contest(force=True)
+            return jsonify(state())
+
+    @app.post("/api/mode")
+    def select_mode():
+        selected = payload().get("mode")
+        if selected not in {"vp", "official"}:
+            raise AppError("参赛模式须为 vp 或 official。")
+        if demo and selected != "vp":
+            raise AppError("离线演示仅提供 VP 示例。", 409)
+        with g.runtime["client"].lock:
+            guard_joint_mutation()
+            store.set_participation_mode(g.owner_sid, contest_key, selected)
+            invalidate_native()
+            return jsonify(state())
+
+    @app.post("/api/connect")
+    def connect():
+        if demo:
+            raise AppError("离线演示无需连接 QOJ。")
+        body = payload()
+        cookie = body.get("cookie")
+        if not isinstance(cookie, str) or not cookie.strip() or len(cookie) > 16384:
+            raise AppError("请输入有效的 QOJ Cookie（最多 16 KB）。")
+        with g.runtime["client"].lock:
+            guard_joint_mutation()
+            g.runtime["client"].import_cookies(cookie)
+            invalidate_native()
+            load_contest(force=True)
+            if g.runtime["contest_error"]:
+                raise AppError(g.runtime["contest_error"], 401)
+            return jsonify(state())
+
+    @app.post("/api/logout")
+    def logout():
+        with g.runtime["client"].lock:
+            guard_joint_mutation()
+            g.runtime["client"].clear()
+            invalidate_native()
+            g.runtime.update(loaded=False, contest=None, contest_error=None, problems={})
+            return jsonify(ok=True)
+
+    def start_run(reset=False):
+        body = payload()
+        team = g.team["name"] if g.team else body.get("team_name", "My Team")
+        if not isinstance(team, str) or not team.strip() or len(team.strip()) > 80:
+            raise AppError("队名长度须为 1–80 个字符。")
+        with g.runtime["client"].lock:
+            if not demo:
+                guard_joint_mutation(start=True)
+                if reset:
+                    raise AppError("原生参赛不能在本地重新计时；请使用 QOJ 提供的参赛操作。", 409)
+                selected = body.get("mode", participation_mode())
+                if selected not in {"vp", "official"}:
+                    raise AppError("参赛模式须为 vp 或 official。")
+                store.set_participation_mode(g.owner_sid, contest_key, selected)
+                invalidate_native()
+                snapshot = native_snapshot()
+                if snapshot.get("error_status"):
+                    raise AppError(snapshot.get("message") or "无法确认 QOJ 参赛状态。", snapshot["error_status"])
+                if not g.runtime["client"].authenticated:
+                    raise AppError("请先连接 QOJ 账号。", 401)
+                selection = body.get("selection") or {}
+                if not isinstance(selection, dict):
+                    raise AppError("请选择有效的 QOJ 参赛选项。")
+                # A new explicit attempt replaces any notice from an older one.
+                # A rejected POST must not keep masquerading as an earlier
+                # request that may have succeeded.
+                g.runtime.pop("entry_notice", None)
+                try:
+                    entered = g.runtime["client"].enter(contest_id, selected,
+                                                        selection={"action": body.get("action"), "values": selection})
+                    if entered and entered.get("entry_uncertain"):
+                        g.runtime["entry_notice"] = (selected, g.runtime["client"].username,
+                                                     entered.get("message") or "参赛请求已发出，但状态尚未确认；请刷新检查，勿重复开始。")
+                finally:
+                    # A failed/uncertain POST may still have reached QOJ. Never
+                    # retry or manufacture a local success; refresh on next GET.
+                    invalidate_native()
+                updated = state()
+                participant = updated.get("participation", {})
+                if (entered and entered.get("entry_pending") and participant.get("entry_stage") == "confirmation"
+                        and participant.get("actions")):
+                    return jsonify(updated)
+                if participant.get("status") not in {"scheduled", "running", "finished"}:
+                    message = participant.get("message") or "QOJ 尚未确认开始参赛，请刷新状态核查。"
+                    return jsonify(error=message, state=updated), 409
+                if selected == "vp" and g.team:
+                    try:
+                        if joint_vp.view(g.team, captain=True)["room"]:
+                            joint_vp.refresh(g.team, snapshot={**participant,
+                                "authenticated": g.runtime["client"].authenticated,
+                                "username": g.runtime["client"].username})
+                    except JointVPError:
+                        # The group may have been cancelled during native entry.
+                        # Its roster must not turn a confirmed QOJ start into an error.
+                        pass
+                return jsonify(updated)
+            contest = require_contest()
+            if not g.runtime["client"].authenticated:
+                raise AppError("请先连接 QOJ 账号。", 401)
+            run = current_run()
+            if not reset and run and run["finished_at"] is None and time.time() < run["ends_at"]:
+                raise AppError("当前 VP 已经开始。", 409)
+            store.start(g.owner_sid, contest_key, team.strip(), contest["duration_seconds"],
+                        freeze_seconds=freeze_minutes * 60)
+            return jsonify(state())
+
+    @app.post("/api/start")
+    def start():
+        return start_run()
+
+    @app.post("/api/reset")
+    def reset():
+        return start_run(reset=True)
+
+    @app.post("/api/finish")
+    def finish():
+        with g.runtime["client"].lock:
+            if not demo:
+                raise AppError("原生参赛由 QOJ 管理结束时间，不能在本地提前结束。", 409)
+            run = active_run()
+            store.finish(run["id"])
+            return jsonify(state())
+
+    @app.get("/api/problems/<int:problem_id>")
+    def get_problem(problem_id):
+        with g.runtime["client"].lock:
+            if not demo and getattr(g, "cli", None) is not None:
+                g.native_validation = True
+                recent_native_snapshot()
+            info = problem_info(problem_id, force=request.args.get("refresh") == "1")
+            visible = {k: v for k, v in info.items() if k != "statement_html"}
+            pdfs = statement_pdfs(info, problem_id)
+            document = BeautifulSoup(info["statement_html"], "html.parser")
+            body = document.body or document
+            for node in body.select("iframe, script, style"):
+                node.decompose()
+            pdf_only = bool(pdfs) and not body.get_text(strip=True) and not body.select("img")
+            visible["statement_pdfs"] = [{"id": item["id"], "name": item["name"],
+                                          "url": f"/api/problems/{problem_id}/pdf/{item['id']}"} for item in pdfs]
+            visible["statement_format"] = "pdf" if pdf_only else "html"
+            if g.role == "member":
+                visible.update(languages=[], submission_available=False, message="此设备为队员机，提交须在队长机进行。")
+            return jsonify({**visible,
+                            "statement_url": f"/api/problems/{problem_id}/statement"})
+
+    @app.get("/api/problems/<int:problem_id>/pdf/<pdf_id>")
+    def problem_pdf(problem_id, pdf_id):
+        client = g.runtime["client"]
+        with client.lock:
+            info = problem_info(problem_id)
+            candidate = next((item for item in statement_pdfs(info, problem_id) if item["id"] == pdf_id), None)
+            if candidate is None:
+                raise AppError("本题没有此 PDF 题面。", 404)
+            try:
+                def fetch_pdf():
+                    return client.fetch("GET", candidate["url"], stream=True,
+                                        headers={"Referer": f"https://qoj.ac/contest/{contest_id}/problem/{problem_id}",
+                                                 "Accept-Encoding": "identity"})
+
+                return statement_cache.response(g.owner_sid, problem_id, candidate["url"],
+                                                fetch_pdf, request.environ)
+            except QOJError as exc:
+                if exc.status == 401:
+                    client.authenticated = False
+                    client.username = ""
+                    invalidate_native()
+                raise
+
+    def public_print(item):
+        return {**item, "view_url": f"/api/prints/{item['id']}/view",
+                "download_url": f"/api/prints/{item['id']}/download"}
+
+    @app.get("/api/prints")
+    def list_prints():
+        require_content()
+        run = current_run()
+        files = prints.listing(g.owner_sid, contest_key, run["id"]) if run else []
+        return jsonify(files=[public_print(item) for item in files], run_id=run["id"] if run else None,
+                       max_file_size=MAX_PRINT_SIZE, max_files=MAX_RUN_FILES, max_total_size=MAX_RUN_BYTES)
+
+    @app.post("/api/prints")
+    def create_print():
+        with g.runtime["client"].lock:
+            active_run()
+            if request.is_json:
+                body = payload()
+                name, content = body.get("name"), body.get("content")
+                if not isinstance(content, str):
+                    raise AppError("打印内容须为文本。")
+                try:
+                    content = content.encode("utf-8")
+                except UnicodeError:
+                    raise AppError("打印内容须为有效的 UTF-8 文本。") from None
+            else:
+                files = request.files.getlist("file")
+                if len(files) != 1 or len(request.files) != 1:
+                    raise AppError("每次请选择一份打印文件。")
+                name = files[0].filename
+                content = files[0].stream.read(MAX_PRINT_SIZE + 1)
+            run = active_run()
+            item = prints.create(g.owner_sid, contest_key, run["id"], name, content)
+            return jsonify(file=public_print(item)), 201
+
+    def print_file(file_id):
+        require_content()
+        run = current_run()
+        if not run:
+            raise AppError("本轮 VP 中没有此打印文件。", 404)
+        return prints.get(g.owner_sid, contest_key, run["id"], file_id)
+
+    @app.get("/api/prints/<file_id>/download")
+    def download_print(file_id):
+        item, path = print_file(file_id)
+        response = send_file(path, download_name=item["name"], as_attachment=True,
+                             mimetype="application/pdf" if item["kind"] == "pdf" else "text/plain")
+        response.headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+        return response
+
+    @app.get("/api/prints/<file_id>/view")
+    def view_print(file_id):
+        item, path = print_file(file_id)
+        if item["kind"] == "pdf":
+            response = send_file(path, download_name=item["name"], mimetype="application/pdf")
+        else:
+            response = Response(render_print(item["name"], path.read_text(encoding="utf-8-sig")),
+                                content_type="text/html; charset=utf-8")
+        response.headers["Content-Security-Policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'"
+        return response
+
+    @app.get("/api/attachments")
+    def get_attachments():
+        with g.runtime["client"].lock:
+            items = contest_attachments(force=request.args.get("refresh") == "1")
+            return jsonify(attachments=[{
+                **item,
+                "download_url": None if item.get("external") else f"/api/attachments/{item['id']}/download"
+            } for item in items], source_url=f"/qoj/contest/{contest_id}", demo=demo)
+
+    @app.get("/api/attachments/<attachment_id>/download")
+    def download_attachment(attachment_id):
+        client = g.runtime["client"]
+        with client.lock:
+            item = next((item for item in contest_attachments() if item["id"] == attachment_id), None)
+            if item is None:
+                raise AppError("该附件不在当前比赛的可访问附件列表中，请刷新列表。", 404)
+            if item.get("external"):
+                raise AppError("此附件是外部链接，请从列表打开原始链接。", 400)
+            if demo:
+                content, filename, content_type = client.attachment(attachment_id)
+                return send_file(content, download_name=filename, mimetype=content_type,
+                                 as_attachment=True, conditional=True)
+            headers = {"Referer": f"https://qoj.ac/contest/{contest_id}", "Accept-Encoding": "identity"}
+            for key in ("Range", "If-Range"):
+                if key in request.headers:
+                    headers[key] = request.headers[key]
+            try:
+                upstream = client.fetch("GET", item["url"], headers=headers, stream=True)
+                # Transfer only the independent response stream; the session lock
+                # is released so a large download does not block submissions.
+                return attachment_response(upstream, item["name"])
+            except QOJError as exc:
+                if exc.status == 401:
+                    client.authenticated = False
+                    client.username = ""
+                    g.runtime["loaded"] = False
+                raise
+
+    @app.get("/api/problems/<int:problem_id>/statement")
+    def statement(problem_id):
+        with g.runtime["client"].lock:
+            html = problem_info(problem_id)["statement_html"]
+        response = Response(html, content_type="text/html; charset=utf-8")
+        response.headers["Content-Security-Policy"] = "default-src 'none'; script-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; font-src 'self'; frame-src 'self'; object-src 'self'; base-uri 'none'; form-action 'none'"
+        return response
+
+    @app.get("/api/submissions/<int:sub_id>/source")
+    def submission_source(sub_id):
+        with g.runtime["client"].lock:
+            require_content()
+            run = current_run()
+            sub = next((row for row in store.submissions(run["id"]) if row["id"] == sub_id), None) if run else None
+            if sub is None:
+                raise AppError("当前参赛记录中没有这条提交。", 404)
+            saved = store.submission_payload(sub_id)
+            if saved is None:
+                raise AppError("这条历史提交没有保存源代码，无法在本地查看。", 404)
+            return jsonify(source=saved["source"], filename=saved["filename"],
+                           language=sub["language"], qoj_id=sub["qoj_id"])
+
+    @app.post("/api/submit")
+    def submit():
+        body = payload()
+        problem_id, language, source = body.get("problem_id"), body.get("language"), body.get("source")
+        if isinstance(problem_id, bool) or not isinstance(problem_id, int):
+            raise AppError("题目 ID 必须是整数。")
+        if not isinstance(source, str) or not source.strip() or len(source.encode("utf-8")) > 256 * 1024:
+            raise AppError("源代码不能为空，且不能超过 256 KiB。")
+        if not isinstance(language, str):
+            raise AppError("请选择编程语言。")
+        filename = body.get("filename") or "solution.txt"
+        if not isinstance(filename, str) or len(filename) > 200 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+\-]*", filename):
+            raise AppError("文件名只能包含字母、数字、下划线、点、加号和减号。")
+        with g.runtime["client"].lock:
+            if not demo:
+                g.native_validation = True
+                recent_native_snapshot()
+            initial_run = active_run()
+            info = problem_info(problem_id)
+            if not info.get("submission_available"):
+                raise AppError(info.get("message") or "此题暂不支持从本界面提交。", 409)
+            if language not in [lang["value"] for lang in info["languages"]]:
+                raise AppError("该题不支持所选语言，请重新选择。")
+            # Recheck after fetching the form, which may have taken several seconds.
+            if not demo:
+                native_snapshot(force=True)
+            run = active_run()
+            if not demo:
+                if run["id"] != initial_run["id"]:
+                    raise AppError("QOJ 账号或参赛场次在读取题目时发生变化，请刷新后重新提交。", 409)
+                find_problem(problem_id)
+            sub_id = store.add_submission(run, info, language)
+            store.save_submission_payload(sub_id, source, filename)
+            prepared = False
+            can_track_post = callable(getattr(g.runtime["client"], "reconcile_submission", None))
+
+            def remember_prepared(receipt):
+                nonlocal prepared
+                store.save_submission_receipt(sub_id, receipt)
+                prepared = True
+
+            try:
+                client = g.runtime["client"]
+                options = {}
+                if can_track_post:
+                    options["on_prepared"] = remember_prepared
+                result = client.submit(contest_id, problem_id, language, source, filename, **options)
+                store.update_submission(sub_id, verdict="PENDING" if demo or result.get("qoj_id") else "UNKNOWN", qoj_id=result.get("qoj_id"),
+                                        qoj_url=result.get("qoj_url"), message=result.get("message", ""))
+            except QOJError as exc:
+                # The adapter calls on_prepared only after its validation and
+                # before its sole POST. Earlier errors cannot have submitted
+                # code; later errors must remain uncertain and GET-only.
+                not_sent = can_track_post and not prepared
+                failure = {"verdict": "FAILED" if not_sent else "UNKNOWN",
+                           "message": f"代码尚未发送到 QOJ：{exc}" if not_sent else str(exc)}
+                if not not_sent and exc.status == 429:
+                    now = time.time()
+                    failure.update(checked_at=now, next_poll_at=now + submission_retry_delay(exc))
+                store.update_submission(sub_id, **failure)
+                raise
+            sub = next(s for s in store.submissions(run["id"]) if s["id"] == sub_id)
+            return jsonify(submission=sub), 201
+
+    def member_resource(target):
+        """Only assets actually referenced by this contest's sanitized statements."""
+        parsed = urlsplit(target)
+        if parsed.netloc and (parsed.scheme != "https" or parsed.netloc != "qoj.ac"):
+            return False
+        path = parsed.path
+        decoded = unquote(unquote(path))
+        if any(part in {".", ".."} for part in decoded.split("/")) or "\\" in decoded or any(ord(c) < 32 for c in decoded):
+            return False
+        if path == decoded and re.fullmatch(r"/js/mathjax/[A-Za-z0-9_./-]+", path):
+            return True
+        # A problem author can put an action URL in an <img>. Being referenced
+        # is necessary, but does not turn a QOJ account action into a safe asset.
+        if decoded == "/download.php":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            accessible_ids = {str(p["id"]) for p in (g.runtime["contest"] or {}).get("problems", [])}
+            if query.get("type") not in (["statement"], ["problem"]) or len(query.get("id", [])) != 1 or query["id"][0] not in accessible_ids:
+                return False
+        elif not re.fullmatch(r"/(?:images|pictures|uploads|source|storage|resources|static)/[A-Za-z0-9_%./@+\-]+\.(?:png|jpe?g|gif|svg|webp|avif|bmp|ico|pdf)", path, re.I):
+            return False
+        local = "/qoj" + path + ("?" + parsed.query if parsed.query else "")
+        for problem in g.runtime["problems"].values():
+            soup = BeautifulSoup(problem.get("statement_html", ""), "html.parser")
+            if any(node.get("src") == local for node in soup.select("img[src], iframe[src]")):
+                return True
+        return False
+
+    @app.route("/qoj", defaults={"path": ""}, methods=["GET", "POST"])
+    @app.route("/qoj/<path:path>", methods=["GET", "POST"])
+    def proxy(path):
+        target = "/" + path
+        if request.query_string:
+            target += "?" + request.query_string.decode("ascii", errors="strict")
+        if g.role == "member" and not member_resource(target):
+            raise AppError("队员机只能通过题目页查看本次比赛内容，不能使用 QOJ 操作页面。", 403)
+        if demo:
+            raise AppError("离线演示模式不访问 QOJ，请以 --contest ID 启动真实比赛。", 409)
+        def login_resource(url):
+            parsed_url = urlsplit(url)
+            if parsed_url.netloc and (parsed_url.scheme != "https" or parsed_url.netloc != "qoj.ac"):
+                return False
+            resource_path = parsed_url.path
+            if unquote(unquote(resource_path)) != resource_path or "\\" in resource_path or ".." in resource_path.split("/"):
+                return False
+            return bool(re.fullmatch(r"/(?:login(?:/2fa)?|logout|login-2fa|two-factor-auth|captcha)(?:/)?", resource_path)
+                        or re.fullmatch(r"/(?:js|css|fonts)/[A-Za-z0-9_./@+\-]+\.(?:js|css|woff2?|ttf|eot|svg)", resource_path)
+                        or re.fullmatch(r"/cdn-cgi/scripts/[a-f0-9]+/cloudflare-static/email-decode\.min\.js", resource_path)
+                        or resource_path in {"/favicon.ico", "/images/logo.png", "/images/logo_small.png"})
+
+        authentication_asset = g.role in {"solo", "captain"} and login_resource(target)
+        if not authentication_asset:
+            require_content()
+        if g.role == "member" and not member_resource(target):
+            raise AppError("队员机只能通过题目页查看本次比赛内容，不能使用 QOJ 操作页面。", 403)
+        headers = {}
+        for name in ("Content-Type", "Accept", "Range", "X-Requested-With"):
+            if name in request.headers:
+                headers[name] = request.headers[name]
+        headers["Origin"] = "https://qoj.ac"
+        referer = request.headers.get("Referer", "")
+        parsed = urlsplit(referer)
+        headers["Referer"] = "https://qoj.ac" + (parsed.path[4:] if parsed.path.startswith("/qoj/") else "/")
+        if parsed.query:
+            headers["Referer"] += "?" + parsed.query
+        with g.runtime["client"].lock:
+            if request.method == "POST" or urlsplit(target).path.rstrip("/") in {"/login", "/logout"}:
+                guard_joint_mutation(start=request.method == "POST" and urlsplit(target).path.startswith("/contest/"))
+            options = ({"url_guard": member_resource} if g.role == "member" else
+                       {"url_guard": login_resource} if authentication_asset else {})
+            upstream = g.runtime["client"].fetch(request.method, target, headers=headers,
+                                               data=request.get_data() if request.method == "POST" else None, **options)
+            kind = upstream.headers.get("Content-Type", "application/octet-stream")
+            if g.role == "member" and any(t in kind.lower() for t in ("text/html", "application/xhtml+xml")):
+                upstream.close()
+                raise AppError("题面资源返回了操作网页，请由队长检查 QOJ 连接。", 403)
+            body = upstream.content
+            if any(t in kind for t in ("text/html", "javascript", "text/css")):
+                upstream.encoding = "utf-8"
+                body = rewrite_proxy(upstream.text, kind, upstream.url).encode("utf-8")
+                if "text/html" in kind:
+                    banner = '<div style="padding:10px;background:#173453;color:white;text-align:center"><a style="color:white" href="/" target="_top">← 返回 VP 界面，点击“刷新连接”完成登录同步</a></div>'
+                    body = re.sub(rb"(<body[^>]*>)", lambda m: m[0] + banner.encode("utf-8"), body, count=1, flags=re.I)
+            response = Response(body, status=upstream.status_code, content_type=kind)
+            for name in ("Content-Disposition", "Content-Range", "Accept-Ranges"):
+                if name in upstream.headers:
+                    response.headers[name] = upstream.headers[name]
+            return response
+
+    return app
+
+
+def serve_app(app, **listen):
+    from waitress import serve
+    serve(app, threads=12, max_request_body_size=3 * 1024 * 1024, **listen)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="QOJ → DOMjudge 风格原生参赛服务")
+    parser.add_argument("--contest", type=int, help="QOJ 比赛 ID，例如 1802")
+    parser.add_argument('--vp-rule', choices=('icpc', 'ccpc26'), default='icpc', help='VP 赛制：传统 ICPC 或 CCPC26 动态揭题')
+    parser.add_argument('--rankland-url', help='CCPC26 必填：RankLand 榜单链接或 vp.xcpc.link/?contest=...')
+    parser.add_argument("--demo", action="store_true", help="离线演示，不访问 QOJ，也不真实评测")
+    parser.add_argument("--host", default="127.0.0.1", help="监听地址；局域网使用 0.0.0.0")
+    parser.add_argument("--port", default=8080, type=int)
+    parser.add_argument('--xcpcio-url', help='现场榜单网址，例如 https://board.xcpcio.com/ccpc/11th/zhengzhou-warmup')
+    parser.add_argument("--mode", choices=("vp", "official"), default="vp", help="默认参赛模式：vp 或 official（正式比赛）；也可在页面选择")
+    parser.add_argument("--scoreboard", choices=("auto", "pc2"), default="auto", help="榜单来源：自动跟随 QOJ 入口，或指定 Training Mode 的 PC2 results 页面")
+    parser.add_argument("--show-unofficial", action=argparse.BooleanOptionalAction, default=None,
+                        help="显示非正式参赛者；--no-show-unofficial 隐藏，指定时优先原生榜单，不指定则保持原有行为")
+    parser.add_argument("--scoreboard-style", choices=("standard", "ccpc"), default="standard",
+                        help="榜单展示：standard 为普通榜单，ccpc 按通过队伍数逐步揭晓题号")
+    parser.add_argument("--ccpc-unlock", type=int, help="CCPC 每题默认揭晓阈值（不同通过队伍数，0 表示立即公开）")
+    parser.add_argument("--ccpc-unlock-overrides", help="CCPC 单题阈值，例如 A=10,C=20；题号区分大小写")
+    parser.add_argument("--ccpc-reveal-after", type=int, help="从 QOJ 本队开赛起多少分钟公开全部题号，仅控制题号，不改变封榜")
+    parser.add_argument("--duration", type=int, help="仅离线演示：指定演示时长（分钟）")
+    parser.add_argument("--data-dir", default=str(ROOT / ".data"), help="SQLite 和本地会话签名密钥目录")
+    parser.add_argument("--secure-cookie", action="store_true", help="在 HTTPS 部署时启用 Secure Cookie")
+    args = parser.parse_args()
+    if not args.demo and args.contest is None:
+        parser.error("请指定 --contest ID，或使用 --demo 查看离线演示。")
+    if args.contest is not None and args.contest < 1:
+        parser.error("--contest 必须是正整数。")
+    if not 1 <= args.port <= 65535:
+        parser.error("--port 必须在 1–65535 之间。")
+    if args.duration is not None and not 1 <= args.duration <= 10080:
+        parser.error("--duration 必须在 1–10080 分钟之间。")
+    if not args.demo and args.duration is not None:
+        parser.error("真实参赛的赛长由 QOJ 决定，--duration 仅用于 --demo。")
+    try:
+        CCPCConfig(style=args.scoreboard_style, unlock=args.ccpc_unlock,
+                   overrides=args.ccpc_unlock_overrides, reveal_after=args.ccpc_reveal_after)
+    except ValueError as exc:
+        parser.error(str(exc))
+    ccpc_options = ({"scoreboard_style": args.scoreboard_style, "ccpc_unlock": args.ccpc_unlock,
+                     "ccpc_unlock_overrides": args.ccpc_unlock_overrides, "ccpc_reveal_after": args.ccpc_reveal_after}
+                    if args.scoreboard_style == "ccpc" else {})
+    app = create_app(args.contest or 1, args.demo, args.duration, args.data_dir, mode=args.mode,
+                     scoreboard=args.scoreboard, show_unofficial=args.show_unofficial, xcpcio_url=args.xcpcio_url, vp_rule=args.vp_rule, rankland_url=args.rankland_url, **ccpc_options)
+    app.config["SESSION_COOKIE_SECURE"] = args.secure_cookie
+    print(f"QOJ VP: http://{'127.0.0.1' if args.host == '0.0.0.0' else args.host}:{args.port}", flush=True)
+    print("Mode: offline demo (simulated verdicts)" if args.demo else f"Contest: https://qoj.ac/contest/{args.contest}", flush=True)
+    serve_app(app, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()
