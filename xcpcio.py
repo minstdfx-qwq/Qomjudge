@@ -250,11 +250,16 @@ class XCPCIOBoard:
         with self.lock:
             if self.cached is not None and time.monotonic() - self.loaded_at < 300:
                 return self.cached
-            base = 'https://board.xcpcio.com/data' + urlsplit(self.url).path
+            base = 'https://board-data.xcpcio.com/data' + urlsplit(self.url).path
             values = []
             for filename in ('config', 'team', 'run'):
                 try:
                     response = self.session.get(base + '/' + filename + '.json', timeout=(5, 15), allow_redirects=False)
+                    # Older deployments may still publish only on the board host.
+                    # Select the source using config, then keep all three files together.
+                    if filename == 'config' and response.status_code == 404:
+                        base = 'https://board.xcpcio.com/data' + urlsplit(self.url).path
+                        response = self.session.get(base + '/config.json', timeout=(5, 15), allow_redirects=False)
                     if response.status_code != 200:
                         raise XCPCIOError(f'XCPCIO {filename} 数据返回 HTTP {response.status_code}。')
                     values.append(response.json())
